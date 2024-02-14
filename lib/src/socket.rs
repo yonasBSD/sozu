@@ -528,7 +528,7 @@ pub mod stats {
     }
 
     #[cfg(unix)]
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
     mod internal {
         pub const OPT_LEVEL: libc::c_int = libc::SOL_TCP;
         pub const OPT_NAME: libc::c_int = libc::TCP_INFO;
@@ -580,7 +580,7 @@ pub mod stats {
     }
 
     #[cfg(unix)]
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
     mod internal {
         pub const OPT_LEVEL: libc::c_int = libc::IPPROTO_TCP;
         pub const OPT_NAME: libc::c_int = 0x106;

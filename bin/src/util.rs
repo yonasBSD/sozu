@@ -6,6 +6,9 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(target_os = "freebsd")]
+use libc::{sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
+
 use nix::{
     errno::Errno,
     fcntl::{fcntl, FcntlArg, FdFlag},
@@ -118,18 +121,18 @@ pub fn get_config_file_path(args: &cli::Args) -> Result<&str, UtilError> {
 pub unsafe fn get_executable_path() -> Result<String, UtilError> {
     let mut capacity = PATH_MAX as usize;
     let mut path: Vec<u8> = Vec::with_capacity(capacity);
-    path.extend(repeat(0).take(capacity));
+    path.extend(std::iter::repeat(0).take(capacity));
 
     let mib: Vec<i32> = vec![CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1];
-    let len = mib.len() * size_of::<i32>();
-    let element_size = size_of::<i32>();
+    let len = mib.len() * std::mem::size_of::<i32>();
+    let element_size = std::mem::size_of::<i32>();
 
     let res = sysctl(
         mib.as_ptr(),
         (len / element_size) as u32,
-        path.as_mut_ptr() as *mut c_void,
+        path.as_mut_ptr() as *mut std::os::raw::c_void,
         &mut capacity,
-        std::ptr::null() as *const c_void,
+        std::ptr::null() as *const std::os::raw::c_void,
         0,
     );
     if res != 0 {

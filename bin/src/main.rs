@@ -163,7 +163,7 @@ fn set_workers_affinity(workers: &Vec<WorkerSession>) {
 /// Can bind multiple processes to a CPU core if there are more processes
 /// than CPU cores. Only works on Linux.
 #[cfg(not(target_os = "linux"))]
-fn set_workers_affinity(_: &Vec<Worker>) {}
+fn set_workers_affinity(_: &Vec<cli::SubCmd>) {}
 
 /// Set a specific process to run onto a specific CPU core
 #[cfg(target_os = "linux")]
