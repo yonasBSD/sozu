@@ -13,7 +13,6 @@ use nix::{
     errno::Errno,
     fcntl::{fcntl, FcntlArg, FdFlag},
 };
-use thiserror;
 
 use sozu_command_lib::config::Config;
 use sozu_lib::metrics::{self, MetricError};
@@ -166,9 +165,10 @@ pub unsafe fn get_executable_path() -> Result<String, UtilError> {
     Ok(path_str)
 }
 
+
 #[cfg(target_os = "macos")]
 extern "C" {
-    pub fn _NSGetExecutablePath(buf: *mut c_char, size: *mut u32) -> i32;
+    pub fn _NSGetExecutablePath(buf: *mut libc::c_char, size: *mut u32) -> i32;
 }
 
 #[cfg(target_os = "macos")]

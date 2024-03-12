@@ -9,7 +9,7 @@ use std::{
 };
 
 use mio::{
-    net::{TcpListener, TcpStream},
+    net::{TcpListener as MioTcpListener, TcpStream},
     unix::SourceFd,
     Interest, Registry, Token,
 };
@@ -17,7 +17,7 @@ use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
 use sozu_command::{
-    logging,
+    logging::CachedTags,
     proto::command::{
         request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
         RequestHttpFrontend, WorkerRequest, WorkerResponse,
@@ -42,7 +42,7 @@ use crate::{
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
-    AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
+    AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
     SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
@@ -245,7 +245,7 @@ impl HttpSession {
             Protocol::HTTP,
             http.context.id,
             http.context.session_address,
-            Some(ws_context),
+            ws_context,
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
@@ -389,7 +389,7 @@ pub struct HttpListener {
     answers: Rc<RefCell<HttpAnswers>>,
     config: HttpListenerConfig,
     fronts: Router,
-    listener: Option<TcpListener>,
+    listener: Option<MioTcpListener>,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -517,12 +517,12 @@ impl HttpProxy {
     }
 
     pub fn get_listener(&self, token: &Token) -> Option<Rc<RefCell<HttpListener>>> {
-        self.listeners.get(token).map(Clone::clone)
+        self.listeners.get(token).cloned()
     }
 
     pub fn remove_listener(&mut self, remove: RemoveListener) -> Result<(), ProxyError> {
         let len = self.listeners.len();
-        let remove_address = remove.address.clone().into();
+        let remove_address = remove.address.into();
         self.listeners
             .retain(|_, l| l.borrow().address != remove_address);
 
@@ -535,7 +535,7 @@ impl HttpProxy {
     pub fn activate_listener(
         &self,
         addr: &SocketAddr,
-        tcp_listener: Option<TcpListener>,
+        tcp_listener: Option<MioTcpListener>,
     ) -> Result<Token, ProxyError> {
         let listener = self
             .listeners
@@ -552,7 +552,7 @@ impl HttpProxy {
             })
     }
 
-    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
+    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, MioTcpListener)> {
         self.listeners
             .iter()
             .filter_map(|(_, listener)| {
@@ -566,18 +566,24 @@ impl HttpProxy {
             .collect()
     }
 
-    pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, TcpListener)> {
-        self.listeners
+    pub fn give_back_listener(
+        &mut self,
+        address: SocketAddr,
+    ) -> Result<(Token, MioTcpListener), ProxyError> {
+        let listener = self
+            .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .and_then(|listener| {
-                let mut owned = listener.borrow_mut();
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
-                owned
-                    .listener
-                    .take()
-                    .map(|listener| (owned.token, listener))
-            })
+        let mut owned = listener.borrow_mut();
+
+        let taken_listener = owned
+            .listener
+            .take()
+            .ok_or(ProxyError::UnactivatedListener)?;
+
+        Ok((owned.token, taken_listener))
     }
 
     pub fn add_cluster(&mut self, cluster: Cluster) -> Result<(), ProxyError> {
@@ -702,14 +708,6 @@ impl HttpProxy {
 
         Ok(())
     }
-
-    pub fn logging(&mut self, logging_filter: String) -> Result<(), ProxyError> {
-        logging::LOGGER.with(|l| {
-            let directives = logging::parse_logging_spec(&logging_filter);
-            l.borrow_mut().set_directives(directives);
-        });
-        Ok(())
-    }
 }
 
 impl HttpListener {
@@ -732,7 +730,7 @@ impl HttpListener {
     pub fn activate(
         &mut self,
         registry: &Registry,
-        tcp_listener: Option<TcpListener>,
+        tcp_listener: Option<MioTcpListener>,
     ) -> Result<Token, ListenerError> {
         if self.active {
             return Ok(self.token);
@@ -838,13 +836,6 @@ impl ProxyConfiguration for HttpProxy {
                 debug!("{} status", request_id);
                 Ok(())
             }
-            Some(RequestType::Logging(logging_filter)) => {
-                debug!(
-                    "{} changing logging filter to {}",
-                    request_id, logging_filter
-                );
-                self.logging(logging_filter)
-            }
             other_command => {
                 debug!(
                     "{} unsupported message for HTTP proxy, ignoring: {:?}",
@@ -884,7 +875,7 @@ impl ProxyConfiguration for HttpProxy {
         let listener = self
             .listeners
             .get(&Token(listener_token.0))
-            .map(Clone::clone)
+            .cloned()
             .ok_or(AcceptError::IoError)?;
 
         if let Err(e) = frontend_sock.set_nodelay(true) {

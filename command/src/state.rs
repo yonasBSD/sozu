@@ -6,14 +6,14 @@ use std::{
     fs::File,
     hash::{Hash, Hasher},
     io::Write,
-    iter::{repeat, FromIterator},
+    iter::repeat,
     net::SocketAddr,
 };
 
 use prost::{DecodeError, Message};
 
 use crate::{
-    certificate::{self, calculate_fingerprint, Fingerprint},
+    certificate::{calculate_fingerprint, CertificateError, Fingerprint},
     proto::{
         command::{
             request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
@@ -47,7 +47,7 @@ pub enum StateError {
     #[error("Wrong request: {0}")]
     WrongRequest(String),
     #[error("Could not add certificate: {0}")]
-    AddCertificate(String),
+    AddCertificate(CertificateError),
     #[error("Could not remove certificate: {0}")]
     RemoveCertificate(String),
     #[error("Could not replace certificate: {0}")]
@@ -130,18 +130,18 @@ impl ConfigState {
             RequestType::RemoveBackend(backend) => self.remove_backend(backend),
 
             // This is to avoid the error message
-            &RequestType::Logging(_)
-            | &RequestType::CountRequests(_)
-            | &RequestType::Status(_)
-            | &RequestType::SoftStop(_)
-            | &RequestType::QueryCertificatesFromWorkers(_)
-            | &RequestType::QueryClusterById(_)
-            | &RequestType::QueryClustersByDomain(_)
-            | &RequestType::QueryMetrics(_)
-            | &RequestType::QueryClustersHashes(_)
-            | &RequestType::ConfigureMetrics(_)
-            | &RequestType::ReturnListenSockets(_)
-            | &RequestType::HardStop(_) => Ok(()),
+            RequestType::Logging(_)
+            | RequestType::CountRequests(_)
+            | RequestType::Status(_)
+            | RequestType::SoftStop(_)
+            | RequestType::QueryCertificatesFromWorkers(_)
+            | RequestType::QueryClusterById(_)
+            | RequestType::QueryClustersByDomain(_)
+            | RequestType::QueryMetrics(_)
+            | RequestType::QueryClustersHashes(_)
+            | RequestType::ConfigureMetrics(_)
+            | RequestType::ReturnListenSockets(_)
+            | RequestType::HardStop(_) => Ok(()),
 
             _other_request => Err(StateError::UndispatchableRequest),
         }
@@ -374,16 +374,20 @@ impl ConfigState {
     }
 
     fn add_certificate(&mut self, add: &AddCertificate) -> Result<(), StateError> {
-        let fingerprint = Fingerprint(
-            calculate_fingerprint(add.certificate.certificate.as_bytes()).map_err(
-                |fingerprint_err| StateError::AddCertificate(fingerprint_err.to_string()),
-            )?,
-        );
+        let fingerprint = add
+            .certificate
+            .fingerprint()
+            .map_err(StateError::AddCertificate)?;
 
         let entry = self
             .certificates
             .entry(add.address.clone().into())
-            .or_insert_with(HashMap::new);
+            .or_default();
+
+        let mut add = add.clone();
+        add.certificate
+            .apply_overriding_names()
+            .map_err(StateError::AddCertificate)?;
 
         if entry.contains_key(&fingerprint) {
             info!(
@@ -393,7 +397,7 @@ impl ConfigState {
             return Ok(());
         }
 
-        entry.insert(fingerprint, add.certificate.clone());
+        entry.insert(fingerprint, add.certificate);
         Ok(())
     }
 
@@ -460,7 +464,7 @@ impl ConfigState {
         let tcp_frontends = self
             .tcp_fronts
             .entry(front.cluster_id.clone())
-            .or_insert_with(Vec::new);
+            .or_default();
 
         let tcp_frontend = TcpFrontend {
             cluster_id: front.cluster_id.clone(),
@@ -510,7 +514,7 @@ impl ConfigState {
         let backends = self
             .backends
             .entry(backend.cluster_id.clone())
-            .or_insert_with(Vec::new);
+            .or_default();
 
         // we might be modifying the sticky id or load balancing parameters
         backends.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
@@ -1248,72 +1252,20 @@ impl ConfigState {
         &self,
         filters: QueryCertificatesFilters,
     ) -> BTreeMap<String, CertificateAndKey> {
-        if let Some(domain) = filters.domain {
-            self.certificates
-                .values()
-                .flat_map(|hash_map| hash_map.iter())
-                .flat_map(|(fingerprint, cert)| {
-                    if cert.names.is_empty() {
-                        let pem = certificate::parse_pem(cert.certificate.as_bytes()).ok()?;
-                        let mut c = cert.to_owned();
-
-                        c.names = certificate::get_cn_and_san_attributes(&pem.contents)
-                            .ok()?
-                            .into_iter()
-                            .collect();
-
-                        return Some((fingerprint, c));
-                    }
-
-                    Some((fingerprint, cert.to_owned()))
-                })
-                .filter(|(_, cert)| cert.names.contains(&domain))
-                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert))
-                .collect()
-        } else if let Some(f) = filters.fingerprint {
-            self.certificates
-                .values()
-                .flat_map(|hash_map| hash_map.iter())
-                .filter(|(fingerprint, _cert)| fingerprint.to_string() == f)
-                .flat_map(|(fingerprint, cert)| {
-                    if cert.names.is_empty() {
-                        let pem = certificate::parse_pem(cert.certificate.as_bytes()).ok()?;
-                        let mut c = cert.to_owned();
-
-                        c.names = certificate::get_cn_and_san_attributes(&pem.contents)
-                            .ok()?
-                            .into_iter()
-                            .collect();
-
-                        return Some((fingerprint, c));
-                    }
-
-                    Some((fingerprint, cert.to_owned()))
-                })
-                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert))
-                .collect()
-        } else {
-            self.certificates
-                .values()
-                .flat_map(|hash_map| hash_map.iter())
-                .flat_map(|(fingerprint, cert)| {
-                    if cert.names.is_empty() {
-                        let pem = certificate::parse_pem(cert.certificate.as_bytes()).ok()?;
-                        let mut c = cert.to_owned();
-
-                        c.names = certificate::get_cn_and_san_attributes(&pem.contents)
-                            .ok()?
-                            .into_iter()
-                            .collect();
-
-                        return Some((fingerprint, c));
-                    }
-
-                    Some((fingerprint, cert.to_owned()))
-                })
-                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert))
-                .collect()
-        }
+        self.certificates
+            .values()
+            .flat_map(|hash_map| hash_map.iter())
+            .filter(|(fingerprint, cert)| {
+                if let Some(domain) = &filters.domain {
+                    cert.names.contains(domain)
+                } else if let Some(f) = &filters.fingerprint {
+                    fingerprint.to_string() == *f
+                } else {
+                    true
+                }
+            })
+            .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.to_owned()))
+            .collect()
     }
 
     pub fn list_frontends(&self, filters: FrontendFilters) -> ListedFrontends {

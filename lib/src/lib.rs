@@ -115,7 +115,7 @@
 //!
 //! We can now define a frontend. A frontend is a way to recognize a request and match
 //! it to a `cluster_id`, depending on the hostname and the beginning of the URL path.
-//! The `address` field must match the one of the HTTP listener we defined before:
+//! The `address` field must match the one of the HTTP listener we defined before:
 //!
 //! ```
 //! use std::collections::BTreeMap;
@@ -209,20 +209,16 @@
 //! Here is the complete example for reference, it matches the `examples/http.rs` example:
 //!
 //! ```
-//! extern crate time;
-//!
 //! #[macro_use]
 //! extern crate sozu_command_lib;
 //!
 //! use std::{collections::BTreeMap, env, io::stdout, thread};
 //!
 //! use anyhow::Context;
-//!
 //! use sozu_command_lib::{
 //!     channel::Channel,
 //!     config::ListenerBuilder,
-//!     info,
-//!     logging::setup_logging,
+//!     logging::setup_default_logging,
 //!     proto::command::{
 //!         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
 //!         PathRule, Request, RequestHttpFrontend, RulePosition, SocketAddress,WorkerRequest,
@@ -230,7 +226,7 @@
 //! };
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     setup_logging("stdout", None, "info", "EXAMPLE");
+//!     setup_default_logging(true, "info", "EXAMPLE");
 //!
 //!     info!("starting up");
 //!
@@ -318,7 +314,6 @@ extern crate quickcheck;
 pub mod util;
 #[macro_use]
 pub mod metrics;
-mod logs;
 
 pub mod backends;
 pub mod features;
@@ -351,17 +346,20 @@ use std::{
 };
 
 use backends::BackendError;
+use hex::FromHexError;
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
 use router::RouterError;
+use socket::ServerBindError;
 use time::{Duration, Instant};
 use tls::CertificateResolverError;
 
 use sozu_command::{
+    logging::{CachedTags, LogContext},
     proto::command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
     ready::Ready,
     state::ClusterId,
-    ObjectKind,
+    AsStr, ObjectKind,
 };
 
 use crate::{backends::BackendMap, router::Route};
@@ -523,21 +521,6 @@ macro_rules! StateMachineBuilder {
     }
 }
 
-pub struct CachedTags {
-    pub tags: BTreeMap<String, String>,
-    pub concatenated: String,
-}
-impl CachedTags {
-    fn new(tags: BTreeMap<String, String>) -> Self {
-        let concatenated = tags
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Self { tags, concatenated }
-    }
-}
-
 pub trait ListenerHandler {
     fn get_addr(&self) -> &SocketAddr;
 
@@ -637,8 +620,6 @@ pub enum AcceptError {
 /// returned by the HTTP, HTTPS and TCP listeners
 #[derive(thiserror::Error, Debug)]
 pub enum ListenerError {
-    #[error("failed to acquire the lock, {0}")]
-    Lock(String),
     #[error("failed to handle certificate request, got a resolver error, {0}")]
     Resolver(CertificateResolverError),
     #[error("failed to parse pem, {0}")]
@@ -655,7 +636,7 @@ pub enum ListenerError {
     RemoveFrontend(RouterError),
 }
 
-/// Returned by the HTTP, HTTPS and TCP proxies
+/// Returned by the HTTP, HTTPS and TCP proxies
 #[derive(thiserror::Error, Debug)]
 pub enum ProxyError {
     #[error("error while soft stopping {proxy_protocol} proxy: {error}")]
@@ -672,7 +653,7 @@ pub enum ProxyError {
     NoListenerFound(SocketAddr),
     #[error("a listener is already present for this token")]
     ListenerAlreadyPresent,
-    #[error("could not create add listener: {0}")]
+    #[error("could not add listener: {0}")]
     AddListener(ListenerError),
     #[error("failed to activate listener with address {address:?}: {listener_error}")]
     ListenerActivation {
@@ -689,15 +670,23 @@ pub enum ProxyError {
     #[error("could not remove frontend: {0}")]
     RemoveFrontend(ListenerError),
     #[error("could not add certificate: {0}")]
-    AddCertificate(ListenerError),
+    AddCertificate(CertificateResolverError),
     #[error("could not remove certificate: {0}")]
-    RemoveCertificate(ListenerError),
+    RemoveCertificate(CertificateResolverError),
     #[error("could not replace certificate: {0}")]
-    ReplaceCertificate(ListenerError),
+    ReplaceCertificate(CertificateResolverError),
     #[error("wrong certificate fingerprint: {0}")]
-    WrongCertificateFingerprint(String),
+    WrongCertificateFingerprint(FromHexError),
     #[error("this request is not supported by the proxy")]
     UnsupportedMessage,
+    #[error("failed to acquire the lock, {0}")]
+    Lock(String),
+    #[error("could not bind to socket {0:?}: {1}")]
+    BindToSocket(SocketAddr, ServerBindError),
+    #[error("error registering socket of listener: {0}")]
+    RegisterListener(std::io::Error),
+    #[error("the listener is not activated")]
+    UnactivatedListener,
 }
 
 use self::server::ListenToken;
@@ -1045,6 +1034,41 @@ impl SessionMetrics {
             (Some(start), Some(end)) => Some(end - start),
             _ => None,
         }
+    }
+
+    pub fn register_end_of_session(&self, context: &LogContext) {
+        let response_time = self.response_time();
+        let service_time = self.service_time();
+
+        if let Some(cluster_id) = context.cluster_id {
+            time!(
+                "response_time",
+                cluster_id,
+                response_time.whole_milliseconds()
+            );
+            time!(
+                "service_time",
+                cluster_id,
+                service_time.whole_milliseconds()
+            );
+        }
+        time!("response_time", response_time.whole_milliseconds());
+        time!("service_time", service_time.whole_milliseconds());
+
+        if let Some(backend_id) = self.backend_id.as_ref() {
+            if let Some(backend_response_time) = self.backend_response_time() {
+                record_backend_metrics!(
+                    context.cluster_id.as_str_or("-"),
+                    backend_id,
+                    backend_response_time.whole_milliseconds(),
+                    self.backend_connection_time(),
+                    self.backend_bin,
+                    self.backend_bout
+                );
+            }
+        }
+
+        incr!("access_logs.count", context.cluster_id, context.backend_id);
     }
 }
 

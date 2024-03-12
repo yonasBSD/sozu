@@ -37,7 +37,6 @@ use time::{Duration, Instant};
 use sozu_command::{
     certificate::Fingerprint,
     config::DEFAULT_CIPHER_SUITES,
-    logging,
     proto::command::{
         request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
         CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
@@ -66,7 +65,7 @@ use crate::{
     server::{ListenToken, SessionManager},
     socket::{server_bind, FrontRustls},
     timer::TimeoutContainer,
-    tls::{CertifiedKeyWrapper, MutexWrappedCertificateResolver, ResolveCertificate},
+    tls::MutexCertificateResolver,
     util::UnwrapLog,
     AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
@@ -372,7 +371,7 @@ impl HttpsSession {
             Protocol::HTTP,
             http.context.id,
             http.context.session_address,
-            Some(ws_context),
+            ws_context,
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
@@ -529,7 +528,7 @@ pub struct HttpsListener {
     config: HttpsListenerConfig,
     fronts: Router,
     listener: Option<MioTcpListener>,
-    resolver: Arc<MutexWrappedCertificateResolver>,
+    resolver: Arc<MutexCertificateResolver>,
     rustls_details: Arc<RustlsServerConfig>,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
@@ -609,51 +608,12 @@ impl L7ListenerHandler for HttpsListener {
     }
 }
 
-impl ResolveCertificate for HttpsListener {
-    type Error = ListenerError;
-
-    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<CertifiedKeyWrapper> {
-        let resolver = self
-            .resolver
-            .0
-            .lock()
-            .map_err(|err| ListenerError::Lock(err.to_string()))
-            .ok()?;
-
-        resolver.get_certificate(fingerprint)
-    }
-
-    fn add_certificate(&mut self, opts: &AddCertificate) -> Result<Fingerprint, Self::Error> {
-        let mut resolver = self
-            .resolver
-            .0
-            .lock()
-            .map_err(|err| ListenerError::Lock(err.to_string()))?;
-
-        resolver
-            .add_certificate(opts)
-            .map_err(ListenerError::Resolver)
-    }
-
-    fn remove_certificate(&mut self, fingerprint: &Fingerprint) -> Result<(), Self::Error> {
-        let mut resolver = self
-            .resolver
-            .0
-            .lock()
-            .map_err(|err| ListenerError::Lock(err.to_string()))?;
-
-        resolver
-            .remove_certificate(fingerprint)
-            .map_err(ListenerError::Resolver)
-    }
-}
-
 impl HttpsListener {
     pub fn try_new(
         config: HttpsListenerConfig,
         token: Token,
     ) -> Result<HttpsListener, ListenerError> {
-        let resolver = Arc::new(MutexWrappedCertificateResolver::default());
+        let resolver = Arc::new(MutexCertificateResolver::default());
 
         let server_config = Arc::new(Self::create_rustls_context(&config, resolver.to_owned())?);
 
@@ -705,7 +665,7 @@ impl HttpsListener {
 
     pub fn create_rustls_context(
         config: &HttpsListenerConfig,
-        resolver: Arc<MutexWrappedCertificateResolver>,
+        resolver: Arc<MutexCertificateResolver>,
     ) -> Result<RustlsServerConfig, ListenerError> {
         let cipher_names = if config.cipher_list.is_empty() {
             DEFAULT_CIPHER_SUITES.to_vec()
@@ -832,15 +792,19 @@ impl HttpsProxy {
         }
     }
 
-    pub fn add_listener(&mut self, config: HttpsListenerConfig, token: Token) -> Option<Token> {
+    pub fn add_listener(
+        &mut self,
+        config: HttpsListenerConfig,
+        token: Token,
+    ) -> Result<Token, ProxyError> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                entry.insert(Rc::new(RefCell::new(
-                    HttpsListener::try_new(config, token).ok()?,
-                )));
-                Some(token)
+                let https_listener =
+                    HttpsListener::try_new(config, token).map_err(ProxyError::AddListener)?;
+                entry.insert(Rc::new(RefCell::new(https_listener)));
+                Ok(token)
             }
-            _ => None,
+            _ => Err(ProxyError::ListenerAlreadyPresent),
         }
     }
 
@@ -850,7 +814,7 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let len = self.listeners.len();
 
-        let remove_address = remove.address.clone().into();
+        let remove_address = remove.address.into();
         self.listeners
             .retain(|_, listener| listener.borrow().address != remove_address);
 
@@ -904,17 +868,6 @@ impl HttpsProxy {
         }
 
         Ok(())
-    }
-
-    pub fn logging(
-        &mut self,
-        logging_filter: String,
-    ) -> Result<Option<ResponseContent>, ProxyError> {
-        logging::LOGGER.with(|l| {
-            let directives = logging::parse_logging_spec(&logging_filter);
-            l.borrow_mut().set_directives(directives);
-        });
-        Ok(None)
     }
 
     pub fn query_all_certificates(&mut self) -> Result<Option<ResponseContent>, ProxyError> {
@@ -1020,22 +973,24 @@ impl HttpsProxy {
             .collect()
     }
 
-    // TODO: return <Result, ProxyError>
     pub fn give_back_listener(
         &mut self,
         address: StdSocketAddr,
-    ) -> Option<(Token, MioTcpListener)> {
-        self.listeners
+    ) -> Result<(Token, MioTcpListener), ProxyError> {
+        let listener = self
+            .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .and_then(|listener| {
-                let mut owned = listener.borrow_mut();
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
-                owned
-                    .listener
-                    .take()
-                    .map(|listener| (owned.token, listener))
-            })
+        let mut owned = listener.borrow_mut();
+
+        let taken_listener = owned
+            .listener
+            .take()
+            .ok_or(ProxyError::UnactivatedListener)?;
+
+        Ok((owned.token, taken_listener))
     }
 
     pub fn add_cluster(
@@ -1131,10 +1086,16 @@ impl HttpsProxy {
             .listeners
             .values()
             .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .ok_or(ProxyError::NoListenerFound(address))?
+            .borrow_mut();
 
-        listener
-            .borrow_mut()
+        let mut resolver = listener
+            .resolver
+            .0
+            .lock()
+            .map_err(|e| ProxyError::Lock(e.to_string()))?;
+
+        resolver
             .add_certificate(&add_certificate)
             .map_err(ProxyError::AddCertificate)?;
 
@@ -1150,19 +1111,25 @@ impl HttpsProxy {
 
         let fingerprint = Fingerprint(
             hex::decode(&remove_certificate.fingerprint)
-                .map_err(|e| ProxyError::WrongCertificateFingerprint(e.to_string()))?,
+                .map_err(ProxyError::WrongCertificateFingerprint)?,
         );
 
         let listener = self
             .listeners
             .values()
             .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .ok_or(ProxyError::NoListenerFound(address))?
+            .borrow_mut();
 
-        listener
-            .borrow_mut()
+        let mut resolver = listener
+            .resolver
+            .0
+            .lock()
+            .map_err(|e| ProxyError::Lock(e.to_string()))?;
+
+        resolver
             .remove_certificate(&fingerprint)
-            .map_err(ProxyError::AddCertificate)?;
+            .map_err(ProxyError::RemoveCertificate)?;
 
         Ok(None)
     }
@@ -1178,10 +1145,16 @@ impl HttpsProxy {
             .listeners
             .values()
             .find(|l| l.borrow().address == address)
-            .ok_or(ProxyError::NoListenerFound(address))?;
+            .ok_or(ProxyError::NoListenerFound(address))?
+            .borrow_mut();
 
-        listener
-            .borrow_mut()
+        let mut resolver = listener
+            .resolver
+            .0
+            .lock()
+            .map_err(|e| ProxyError::Lock(e.to_string()))?;
+
+        resolver
             .replace_certificate(&replace_certificate)
             .map_err(ProxyError::ReplaceCertificate)?;
 
@@ -1336,13 +1309,6 @@ impl ProxyConfiguration for HttpsProxy {
             RequestType::Status(_) => {
                 debug!("{} status", request_id);
                 Ok(None)
-            }
-            RequestType::Logging(logging_filter) => {
-                debug!(
-                    "{} changing logging filter to {}",
-                    request_id, logging_filter
-                );
-                self.logging(logging_filter)
             }
             RequestType::QueryCertificatesFromWorkers(filters) => {
                 if let Some(domain) = filters.domain {
@@ -1592,20 +1558,23 @@ mod tests {
         ));
 
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
-        let resolver = Arc::new(MutexWrappedCertificateResolver::default());
+        let resolver = Arc::new(MutexCertificateResolver::default());
 
-        let server_config = RustlsServerConfig::builder_with_protocol_versions(&[
-            &rustls::version::TLS12,
-            &rustls::version::TLS13,
-        ])
-        .with_no_client_auth()
-        .with_cert_resolver(resolver.clone());
+        let crypto_provider = Arc::new(ring::default_provider());
+
+        let server_config = RustlsServerConfig::builder_with_provider(crypto_provider)
+            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
+            .expect("could not create rustls config server")
+            .with_no_client_auth()
+            .with_cert_resolver(resolver.clone());
 
         let rustls_details = Arc::new(server_config);
 
         let default_config = ListenerBuilder::new_https(address.clone())
             .to_tls(None)
             .expect("Could not create default HTTPS listener config");
+
+        println!("it doesn't even matter");
 
         let listener = HttpsListener {
             listener: None,

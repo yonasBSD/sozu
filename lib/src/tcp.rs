@@ -14,13 +14,18 @@ use mio::{
 use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
-use sozu_command::{config::MAX_LOOP_ITERATIONS, proto::command::request::RequestType, ObjectKind};
+use sozu_command::{
+    config::MAX_LOOP_ITERATIONS,
+    logging::{EndpointRecord, LogContext},
+    proto::command::request::RequestType,
+    ObjectKind,
+};
 
 use crate::{
     backends::{Backend, BackendMap},
-    logs::{Endpoint, LogContext, RequestRecord},
     pool::{Checkout, Pool},
     protocol::{
+        pipe::WebSocketContext,
         proxy_protocol::{
             expect::ExpectProxyProtocol, relay::RelayProxyProtocol, send::SendProxyProtocol,
         },
@@ -30,7 +35,6 @@ use crate::{
     server::{push_event, ListenToken, SessionManager, CONN_RETRIES, TIMER},
     socket::{server_bind, stats::socket_rtt},
     sozu_command::{
-        logging,
         proto::command::{
             Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig,
             WorkerRequest, WorkerResponse,
@@ -156,7 +160,7 @@ impl TcpSession {
                     Protocol::TCP,
                     request_id,
                     frontend_address,
-                    None,
+                    WebSocketContext::Tcp,
                 );
                 pipe.set_cluster_id(cluster_id.clone());
                 TcpStateMachine::Pipe(pipe)
@@ -191,20 +195,24 @@ impl TcpSession {
 
     fn log_request(&self) {
         let listener = self.listener.borrow();
-        RequestRecord {
-            error: None,
-            context: self.log_context(),
+        let context = self.log_context();
+        self.metrics.register_end_of_session(&context);
+        info_access!(
+            message: None,
+            context,
             session_address: self.frontend_address,
             backend_address: None,
             protocol: "TCP",
-            endpoint: Endpoint::Tcp { context: None },
-            tags: listener.get_concatenated_tags(&listener.get_addr().to_string()),
+            endpoint: EndpointRecord::Tcp,
+            tags: listener.get_tags(&listener.get_addr().to_string()),
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,
-            metrics: &self.metrics,
             user_agent: None,
-        }
-        .log();
+            service_time: self.metrics.service_time(),
+            response_time: self.metrics.response_time(),
+            bytes_in: self.metrics.bin,
+            bytes_out: self.metrics.bout
+        );
     }
 
     fn front_hup(&mut self) -> SessionResult {
@@ -1003,7 +1011,6 @@ pub struct TcpListener {
     cluster_id: Option<String>,
     config: TcpListenerConfig,
     listener: Option<MioTcpListener>,
-    pool: Rc<RefCell<Pool>>,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -1026,52 +1033,42 @@ impl ListenerHandler for TcpListener {
 }
 
 impl TcpListener {
-    fn new(
-        config: TcpListenerConfig,
-        pool: Rc<RefCell<Pool>>,
-        token: Token,
-    ) -> Result<TcpListener, ListenerError> {
+    fn new(config: TcpListenerConfig, token: Token) -> Result<TcpListener, ListenerError> {
         Ok(TcpListener {
             cluster_id: None,
             listener: None,
             token,
             address: config.address.clone().into(),
-            pool,
             config,
             active: false,
             tags: BTreeMap::new(),
         })
     }
 
-    // TODO: return Result with context
     pub fn activate(
         &mut self,
         registry: &Registry,
         tcp_listener: Option<MioTcpListener>,
-    ) -> Option<Token> {
+    ) -> Result<Token, ProxyError> {
         if self.active {
-            return Some(self.token);
+            return Ok(self.token);
         }
 
-        let mut listener = tcp_listener.or_else(|| {
-            server_bind(self.config.address.clone().into())
-                .map_err(|e| {
-                    error!("could not create listener {:?}: {}", self.config.address, e);
-                })
-                .ok()
-        });
-
-        if let Some(ref mut sock) = listener {
-            if let Err(e) = registry.register(sock, self.token, Interest::READABLE) {
-                error!("error registering socket({:?}): {:?}", sock, e);
+        let mut listener = match tcp_listener {
+            Some(listener) => listener,
+            None => {
+                let address = self.config.address.clone().into();
+                server_bind(address).map_err(|e| ProxyError::BindToSocket(address, e))?
             }
-        } else {
-            return None;
-        }
+        };
 
-        self.listener = listener;
+        registry
+            .register(&mut listener, self.token, Interest::READABLE)
+            .map_err(|io_err| ProxyError::RegisterListener(io_err))?;
+
+        self.listener = Some(listener);
         self.active = true;
-        Some(self.token)
+        Ok(self.token)
     }
 }
 
@@ -1108,12 +1105,14 @@ pub struct TcpProxy {
     configs: HashMap<ClusterId, ClusterConfiguration>,
     registry: Registry,
     sessions: Rc<RefCell<SessionManager>>,
+    pool: Rc<RefCell<Pool>>,
 }
 
 impl TcpProxy {
     pub fn new(
         registry: Registry,
         sessions: Rc<RefCell<SessionManager>>,
+        pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> TcpProxy {
         TcpProxy {
@@ -1123,20 +1122,19 @@ impl TcpProxy {
             fronts: HashMap::new(),
             registry,
             sessions,
+            pool,
         }
     }
 
-    // TODO: return Result with context
     pub fn add_listener(
         &mut self,
         config: TcpListenerConfig,
-        pool: Rc<RefCell<Pool>>,
         token: Token,
     ) -> Result<Token, ProxyError> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
                 let tcp_listener =
-                    TcpListener::new(config, pool, token).map_err(ProxyError::AddListener)?;
+                    TcpListener::new(config, token).map_err(ProxyError::AddListener)?;
                 entry.insert(Rc::new(RefCell::new(tcp_listener)));
                 Ok(token)
             }
@@ -1151,16 +1149,18 @@ impl TcpProxy {
         self.listeners.len() < len
     }
 
-    // TODO: return Result with context
     pub fn activate_listener(
         &self,
         addr: &SocketAddr,
         tcp_listener: Option<MioTcpListener>,
-    ) -> Option<Token> {
-        self.listeners
+    ) -> Result<Token, ProxyError> {
+        let listener = self
+            .listeners
             .values()
             .find(|listener| listener.borrow().address == *addr)
-            .and_then(|listener| listener.borrow_mut().activate(&self.registry, tcp_listener))
+            .ok_or(ProxyError::NoListenerFound(*addr))?;
+
+        listener.borrow_mut().activate(&self.registry, tcp_listener)
     }
 
     pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, MioTcpListener)> {
@@ -1177,19 +1177,24 @@ impl TcpProxy {
             .collect()
     }
 
-    // TODO: return Result with context
-    pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, MioTcpListener)> {
-        self.listeners
+    pub fn give_back_listener(
+        &mut self,
+        address: SocketAddr,
+    ) -> Result<(Token, MioTcpListener), ProxyError> {
+        let listener = self
+            .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .and_then(|listener| {
-                let mut owned = listener.borrow_mut();
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
-                owned
-                    .listener
-                    .take()
-                    .map(|listener| (owned.token, listener))
-            })
+        let mut owned = listener.borrow_mut();
+
+        let taken_listener = owned
+            .listener
+            .take()
+            .ok_or(ProxyError::UnactivatedListener)?;
+
+        Ok((owned.token, taken_listener))
     }
 
     pub fn add_tcp_front(&mut self, front: RequestTcpFrontend) -> Result<(), ProxyError> {
@@ -1276,17 +1281,6 @@ impl ProxyConfiguration for TcpProxy {
                 info!("{} status", message.id);
                 WorkerResponse::ok(message.id)
             }
-            RequestType::Logging(logging_filter) => {
-                info!(
-                    "{} changing logging filter to {}",
-                    message.id, logging_filter
-                );
-                logging::LOGGER.with(|l| {
-                    let directives = logging::parse_logging_spec(&logging_filter);
-                    l.borrow_mut().set_directives(directives);
-                });
-                WorkerResponse::ok(message.id)
-            }
             RequestType::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
                     proxy_protocol: cluster
@@ -1358,7 +1352,7 @@ impl ProxyConfiguration for TcpProxy {
             .ok_or(AcceptError::IoError)?;
 
         let owned = listener.borrow();
-        let mut pool = owned.pool.borrow_mut();
+        let mut pool = self.pool.borrow_mut();
 
         let (front_buffer, back_buffer) = match (pool.checkout(), pool.checkout()) {
             (Some(fb), Some(bb)) => (fb, bb),
@@ -1466,9 +1460,9 @@ pub mod testing {
             Token(key)
         };
 
-        let mut proxy = TcpProxy::new(registry, sessions.clone(), backends.clone());
+        let mut proxy = TcpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
         proxy
-            .add_listener(config, pool.clone(), token)
+            .add_listener(config, token)
             .with_context(|| "Failed at creating adding the listener")?;
         proxy
             .activate_listener(&address, None)
